@@ -5,4 +5,6 @@ project(
   LANGUAGES CUDA
 )
 
+set(CMAKE_CUDA_ARCHITECTURES "70")
+
 add_executable(test test.cu)
