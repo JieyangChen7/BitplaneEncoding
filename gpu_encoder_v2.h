@@ -38,13 +38,6 @@ __device__ void print_bits(T v, int num_bits, bool reverse = false) {
 }
 
 
-// Optimization Overview
-// 1. Assign each batch to a single thread block
-// 2. Utilize shared memory to minimize global memory access
-// 3. Optimize bit operation(Needs setting of -arch=sm_70 or higher to support __ballot_sync)
-// 4. Make sure coalesced memory access
-
-
 template <typename T, typename T_fp, typename T_sfp, typename T_bp>
 __global__ void encode(T* v, T_bp* encoded_bitplanes, int n, int b, int exp) {
   constexpr int batch_size = sizeof(T_bp) * 8;  // Most likely 32 here
@@ -53,26 +46,19 @@ __global__ void encode(T* v, T_bp* encoded_bitplanes, int n, int b, int exp) {
   const int tid = threadIdx.x;
   const int global_idx = batch_idx * batch_size + tid;
 
-  __shared__ T_fp s_fp_data[batch_size];
-  __shared__ bool s_signs[batch_size];
-
-  // Load data and process data
   T data = (global_idx < n) ? v[global_idx] : T(0);
   T shifted = ldexp(data, b - exp);
-  s_fp_data[tid] = static_cast<T_fp>(fabs(shifted));
-  s_signs[tid] = signbit(data);
-  __syncthreads();
+  bool sign = signbit(data);
 
-  // Process bit planes of signs
-  unsigned sign_bit = s_signs[tid] ? 1 : 0;
-  unsigned sign_mask = __ballot_sync(0xFFFFFFFF, sign_bit);
+
+  unsigned sign_mask = __ballot_sync(0xFFFFFFFF, sign? 1 : 0);
   if (tid == 0) {
     encoded_bitplanes[batch_idx * 2 + 1] = static_cast<T_bp>(sign_mask);
   }
 
   // Process bit planes of data
   for (int bp = 0; bp < b; ++bp) {
-    unsigned bit = (s_fp_data[tid] >> (b - 1 - bp)) & 1;
+    unsigned bit = (static_cast<T_bp>(shifted) >> (b - 1 - bp)) & 1;
     unsigned data_mask = __ballot_sync(0xFFFFFFFF, bit);
     if (tid == 0) {
       const int plane_idx = bp * num_batches * 2 + batch_idx * 2;
@@ -82,7 +68,7 @@ __global__ void encode(T* v, T_bp* encoded_bitplanes, int n, int b, int exp) {
 }
 
 template <typename T, typename T_fp, typename T_sfp, typename T_bp>
-__global__ void decode(T* v, T_bp* encoded_bitplanes, int n, int b, int exp) {
+__global__ void decode(T* v, const T_bp*  encoded_bitplanes, int n, int b, int exp) {
   constexpr int batch_size = sizeof(T_bp) * 8;
   const int num_batches = (n + batch_size - 1) / batch_size;
   const int batch_idx = blockIdx.x;
@@ -91,26 +77,15 @@ __global__ void decode(T* v, T_bp* encoded_bitplanes, int n, int b, int exp) {
 
   if (global_idx >= n) return;
 
-  __shared__ T_bp s_sign_mask;
-  __shared__ T_bp s_data_masks[32]; // Assuming support max bitplanes of 32
-
-  if (tid == 0) {
-    s_sign_mask = encoded_bitplanes[batch_idx * 2 + 1];
-  }
-
-  for (int bp = 0; bp < b; ++bp) {
-    if (tid == 0) {
-      const int plane_idx = bp * num_batches * 2 + batch_idx * 2;
-      s_data_masks[bp] = encoded_bitplanes[plane_idx];
-    }
-  }
-  __syncthreads();
-
-  const bool sign = (s_sign_mask >> tid) & 1;
+  const T_bp sign_mask = encoded_bitplanes[batch_idx * 2 + 1];
+  const bool sign = (sign_mask >> tid) & 1;
 
   T_fp fp_val = 0;
+
   for (int bp = 0; bp < b; ++bp) {
-    const unsigned bit = (s_data_masks[bp] >> tid) & 1;
+    const int plane_idx = bp * num_batches * 2 + batch_idx * 2;
+    const T_bp data_mask = encoded_bitplanes[plane_idx];
+    const unsigned bit = (data_mask >> tid) & 1;
     fp_val |= (bit << (b - 1 - bp));
   }
 
